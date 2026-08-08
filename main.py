@@ -7,12 +7,31 @@ import os
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from fastapi.responses import RedirectResponse
+import httpx
+from dotenv import load_dotenv
+import os
+import secrets
+from firebase_config import db
+
+load_dotenv()
 
 api_key = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 app = FastAPI()
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 #Rate limiter setup.
@@ -23,14 +42,147 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests. Try again in a minute."})
 app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+oauth_state = {}
+token = ''
 
+@app.get("/auth/github/login")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://www.portflow.co.in"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+async def github_login(uid:str):
+
+    state = secrets.token_urlsafe(32)
+    oauth_state[state] = uid
+
+    github_url = (
+        "https://github.com/login/oauth/authorize"
+        f"?client_id={GITHUB_CLIENT_ID}"
+        f"&state={state}"
+        "&scope=read:user"
+    )
+    return RedirectResponse(github_url)
+
+@app.get("/auth/github/callback")
+async def github_callback(code: str, state:str):
+
+    uid = oauth_state.pop(state, None)
+    if uid is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OAuth state"
+        )
+    if uid is None:
+        return {"error": "Invalid state"}
+    
+    async with httpx.AsyncClient() as client:
+
+        token_response = await client.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code,
+            },
+        )
+
+        access_token = token_response.json()["access_token"]
+
+        user_response = await client.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+
+        github_user = user_response.json()
+
+    print('uid', uid)
+    print('token', access_token)
+
+    db.collection("users").document(uid).set(
+    {
+        "github_access_token": access_token,
+        "github_username": github_user["login"],
+        "github_id": github_user["id"],
+        "github_connected": True,
+    },
+    merge=True,
 )
+    
+
+    doc = db.collection("users").document(uid).get()
+
+    print(doc.exists)
+
+    print(doc.to_dict())
+    print('This is token', token)
+
+
+    return RedirectResponse(
+        "http://localhost:5173/resume?template=sde&method=upload&github=connected"
+    )
+
+
+
+@app.get("/github/status")
+async def github_status(uid: str):
+    doc = db.collection("users").document(uid).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    data = doc.to_dict()
+    return {
+        "connected": data.get("github_connected", False)
+    }
+
+@app.get("/github/contributions")
+async def github_contributions(uid:str):
+
+    doc = db.collection("users").document(uid).get()
+    if not doc.exists:
+        return {"error": "User not found"}
+
+    data = doc.to_dict()
+    access_token = data["github_access_token"]
+
+    if not access_token:
+        raise HTTPException(
+            status_code=404,
+            detail="No Access Token Found"
+        )
+
+    query = """
+    query {
+      viewer {
+        contributionsCollection {
+          contributionCalendar {
+            totalContributions
+            weeks {
+              contributionDays {
+                contributionCount
+                date
+                weekday
+                color
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.github.com/graphql",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            json={"query": query},
+        )
+
+    return response.json()
 
 @app.post("/parse-resume")
 @limiter.limit("1/minute")
