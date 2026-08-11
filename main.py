@@ -27,6 +27,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "https://www.portflow.co.in",
+        "https://portflow.co.in",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -44,6 +46,7 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.portflow.co.in")
 oauth_state = {}
 token = ''
 
@@ -121,7 +124,7 @@ async def github_callback(code: str, state:str):
 
 
     return RedirectResponse(
-        "http://localhost:5173/resume?template=sde&method=upload&github=connected"
+        f"{FRONTEND_URL}/resume?template=sde&method=upload&github=connected"
     )
 
 
