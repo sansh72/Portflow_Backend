@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pdfplumber
@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import os
 import secrets
 from firebase_config import db
+from firebase_admin import auth as admin_auth
 
 load_dotenv()
 
@@ -47,6 +48,7 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.portflow.co.in")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 oauth_state = {}
 token = ''
 
@@ -138,6 +140,25 @@ async def github_status(uid: str):
     return {
         "connected": data.get("github_connected", False)
     }
+
+@app.delete("/admin/users/{uid}")
+async def delete_user(uid: str, x_admin_secret: str = Header(None)):
+    # Protect this destructive endpoint with a shared admin secret
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # 1. Delete every Firestore doc for this user:
+    #    the account doc plus each template-specific portfolio collection
+    for coll in ("users", "sde", "bda", "custom"):
+        db.collection(coll).document(uid).delete()
+
+    # 2. Delete the Firebase Auth (Google SSO) account itself
+    try:
+        admin_auth.delete_user(uid)
+    except admin_auth.UserNotFoundError:
+        pass
+
+    return {"deleted": uid}
 
 @app.get("/github/contributions")
 async def github_contributions(uid:str):
