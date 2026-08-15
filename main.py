@@ -160,6 +160,14 @@ async def delete_user(uid: str, x_admin_secret: str = Header(None)):
 
     return {"deleted": uid}
 
+@app.get("/admin/debug")
+async def admin_debug():
+    # TEMPORARY: reports whether the backend sees ADMIN_SECRET (not its value)
+    return {
+        "admin_secret_set": bool(ADMIN_SECRET),
+        "admin_secret_length": len(ADMIN_SECRET) if ADMIN_SECRET else 0,
+    }
+
 @app.get("/github/contributions")
 async def github_contributions(uid:str):
 
