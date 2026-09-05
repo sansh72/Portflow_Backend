@@ -12,10 +12,13 @@ import httpx
 from dotenv import load_dotenv
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 from firebase_config import db
 from google.cloud import firestore
 from firebase_admin import auth as admin_auth
 import errors
+from auth import require_uid
+from fastapi import Depends
 import suggestions
 import payments
 import quota
@@ -62,15 +65,20 @@ GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.portflow.co.in")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET")
-oauth_state = {}
 token = ''
 
-@app.get("/auth/github/login")
+@app.post("/auth/github/start")
+async def github_start(uid: str = Depends(require_uid)):
+    """Begin GitHub OAuth for the *authenticated* user.
 
-async def github_login(uid:str):
+    Replaces a GET that took ?uid= from the query string, which let anyone
+    start a flow against someone else's account: authorise with your own
+    GitHub and you overwrote the victim's stored token and username.
 
-    # Without this the missing value interpolates as the string "None" and the
-    # user lands on a GitHub 404 with no clue what went wrong.
+    A POST rather than a redirect because a top-level browser navigation
+    cannot carry an Authorization header - the frontend calls this, then
+    navigates to the URL it returns.
+    """
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
         raise HTTPException(
             status_code=503,
@@ -78,27 +86,44 @@ async def github_login(uid:str):
         )
 
     state = secrets.token_urlsafe(32)
-    oauth_state[state] = uid
+    # Firestore rather than a process dictionary: Render restarts between the
+    # redirect out and the callback back would otherwise lose the state, and
+    # an in-memory dict grows without bound.
+    db.collection("oauth_states").document(state).set({
+        "uid": uid,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
-    github_url = (
-        "https://github.com/login/oauth/authorize"
-        f"?client_id={GITHUB_CLIENT_ID}"
-        f"&state={state}"
-        "&scope=read:user"
-    )
-    return RedirectResponse(github_url)
+    return {
+        "authorize_url": (
+            "https://github.com/login/oauth/authorize"
+            f"?client_id={GITHUB_CLIENT_ID}"
+            f"&state={state}"
+            "&scope=read:user"
+        )
+    }
 
 @app.get("/auth/github/callback")
 async def github_callback(code: str, state:str):
 
-    uid = oauth_state.pop(state, None)
-    if uid is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OAuth state"
-        )
-    if uid is None:
-        return {"error": "Invalid state"}
+    state_ref = db.collection("oauth_states").document(state)
+    state_doc = state_ref.get()
+    if not state_doc.exists:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    state_data = state_doc.to_dict() or {}
+    uid = state_data.get("uid")
+    # Single use, whatever happens next.
+    state_ref.delete()
+
+    if not uid:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    started = state_data.get("created_at")
+    if started:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(started)
+        if age > timedelta(minutes=15):
+            raise HTTPException(status_code=400, detail="This sign-in link expired. Try again.")
     
     async with httpx.AsyncClient() as client:
 
@@ -124,27 +149,25 @@ async def github_callback(code: str, state:str):
 
         github_user = user_response.json()
 
-    print('uid', uid)
-    print('token', access_token)
+    # The token lives in a collection no browser can read. It used to sit on
+    # users/{uid}, which the security rules make readable by any signed-in
+    # user (the public-profile username lookup needs that), so every user's
+    # GitHub token was readable by every other user.
+    db.collection("github_tokens").document(uid).set({
+        "access_token": access_token,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     db.collection("users").document(uid).set(
-    {
-        "github_access_token": access_token,
-        "github_username": github_user["login"],
-        "github_id": github_user["id"],
-        "github_connected": True,
-    },
-    merge=True,
-)
-    
-
-    doc = db.collection("users").document(uid).get()
-
-    print(doc.exists)
-
-    print(doc.to_dict())
-    print('This is token', token)
-
+        {
+            "github_username": github_user["login"],
+            "github_id": github_user["id"],
+            "github_connected": True,
+            # Clear any token written by the previous version.
+            "github_access_token": firestore.DELETE_FIELD,
+        },
+        merge=True,
+    )
 
     return RedirectResponse(
         f"{FRONTEND_URL}/resume?template=sde&method=upload&github=connected"
@@ -153,14 +176,14 @@ async def github_callback(code: str, state:str):
 
 
 @app.get("/github/status")
-async def github_status(uid: str):
+async def github_status(uid: str = Depends(require_uid)):
+    """Whether the authenticated user has connected GitHub.
+
+    Took ?uid= before, so anyone could probe any account.
+    """
     doc = db.collection("users").document(uid).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="User not found")
-    data = doc.to_dict()
-    return {
-        "connected": data.get("github_connected", False)
-    }
+    data = doc.to_dict() or {}
+    return {"connected": bool(data.get("github_connected", False))}
 
 @app.delete("/admin/users/{uid}")
 async def delete_user(uid: str, x_admin_secret: str = Header(None)):
@@ -265,6 +288,7 @@ async def purge_user_github(uid: str, x_admin_secret: str = Header(None)):
     if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    db.collection("github_tokens").document(uid).delete()
     db.collection("users").document(uid).update({
         "github_connected": False,
         "github_access_token": firestore.DELETE_FIELD,
@@ -324,20 +348,30 @@ async def admin_debug():
     }
 
 @app.get("/github/contributions")
-async def github_contributions(uid:str):
+async def github_contributions(uid: str = Depends(require_uid)):
+    """The authenticated user's own contribution calendar.
 
-    doc = db.collection("users").document(uid).get()
-    if not doc.exists:
-        return {"error": "User not found"}
-
-    data = doc.to_dict()
-    access_token = data["github_access_token"]
+    Took ?uid= before, which handed anyone's data to anyone who knew a uid.
+    """
+    token_doc = db.collection("github_tokens").document(uid).get()
+    access_token = (token_doc.to_dict() or {}).get("access_token") if token_doc.exists else None
 
     if not access_token:
-        raise HTTPException(
-            status_code=404,
-            detail="No Access Token Found"
-        )
+        # Users who connected before the token moved still have it on their
+        # user document; migrate them across on first use.
+        legacy = db.collection("users").document(uid).get().to_dict() or {}
+        access_token = legacy.get("github_access_token")
+        if access_token:
+            db.collection("github_tokens").document(uid).set({
+                "access_token": access_token,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            db.collection("users").document(uid).update(
+                {"github_access_token": firestore.DELETE_FIELD}
+            )
+
+    if not access_token:
+        raise HTTPException(status_code=404, detail="GitHub is not connected.")
 
     query = """
     query {
