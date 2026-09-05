@@ -38,6 +38,20 @@ SECTION_PATTERNS = (
     re.compile(rf"^customSections\.{_CUSTOM_ID}\.items\.{_INDEX}\.description$"),
 )
 
+# Collections that can be reviewed as a whole rather than one field at a time.
+# A review looks at every entry together and advises which to keep, rewrite or
+# drop - something a per-section prompt cannot do, since it only ever sees one.
+REVIEWABLE_COLLECTIONS = {"projects": "name", "experience": "role"}
+
+# How each collection is laid out on the page. The review prompt uses this so
+# it can advise on a concrete number to keep instead of guessing.
+COLLECTION_LAYOUT = {
+    "projects": {"keep_target": 3, "layout": "three across a single row"},
+    "experience": {"keep_target": 4, "layout": "as a vertical list"},
+}
+
+MIN_COLLECTION_ITEMS = 2
+
 # Sections shorter than this aren't worth an LLM call.
 MIN_SECTION_CHARS = 30
 MAX_SECTION_CHARS = 8000
@@ -121,3 +135,28 @@ def section_version(doc_data: dict, section_id: str) -> int:
         return int(versions.get(section_id, 0))
     except (TypeError, ValueError):
         return 0
+
+
+def read_collection(portfolio: dict, collection: str):
+    """Return [{index, title, description}] for a reviewable collection.
+
+    None if the collection is missing or isn't a list. Indexes are positions in
+    the stored array, so the frontend can map advice back to a specific entry.
+    """
+    title_field = REVIEWABLE_COLLECTIONS.get(collection)
+    if title_field is None:
+        return None
+    items = (portfolio or {}).get(collection)
+    if not isinstance(items, list):
+        return None
+
+    entries = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        entries.append({
+            "index": index,
+            "title": str(item.get(title_field) or "").strip()[:200],
+            "description": str(item.get("description") or "").strip()[:1500],
+        })
+    return entries
