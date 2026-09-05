@@ -13,10 +13,13 @@ from dotenv import load_dotenv
 import os
 import secrets
 from firebase_config import db
+from google.cloud import firestore
 from firebase_admin import auth as admin_auth
 import errors
 import suggestions
 import payments
+import quota
+import plans
 
 load_dotenv()
 
@@ -65,6 +68,14 @@ token = ''
 @app.get("/auth/github/login")
 
 async def github_login(uid:str):
+
+    # Without this the missing value interpolates as the string "None" and the
+    # user lands on a GitHub 404 with no clue what went wrong.
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="GitHub sync is not configured on the server.",
+        )
 
     state = secrets.token_urlsafe(32)
     oauth_state[state] = uid
@@ -169,6 +180,121 @@ async def delete_user(uid: str, x_admin_secret: str = Header(None)):
         pass
 
     return {"deleted": uid}
+
+@app.get("/admin/users")
+async def list_users(x_admin_secret: str = Header(None)):
+    """Every user with their plan and today's remaining AI credits.
+
+    The admin UI used to read Firestore straight from the browser without
+    signing in. Once the security rules land that stops working - and usage
+    counters are owner-only regardless - so this goes through the Admin SDK,
+    guarded by the shared admin secret.
+    """
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    date_key = quota.today_key()
+    docs = list(db.collection("users").stream())
+
+    # One batched read for every usage counter. Fetching them one at a time is
+    # a round trip per user, which is slow enough to hang the page.
+    usage_refs = [
+        db.collection("users").document(d.id).collection("usage").document(date_key)
+        for d in docs
+    ]
+    used_by_uid = {}
+    if usage_refs:
+        for snap in db.get_all(usage_refs):
+            if snap.exists:
+                # parent of the usage doc's collection is the user document
+                used_by_uid[snap.reference.parent.parent.id] = int(
+                    (snap.to_dict() or {}).get("suggest_fix", 0)
+                )
+
+    users = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        plan = plans.resolve_plan(data)
+        limit = plans.daily_limit(plan)
+        used = used_by_uid.get(doc.id, 0)
+
+        users.append({
+            "id": doc.id,
+            "username": data.get("username"),
+            "email": data.get("email"),
+            "createdAt": (data.get("createdAt") or "").split("T")[0],
+            "github_connected": bool(data.get("github_connected")),
+            "plan": plan,
+            "subscription_status": data.get("subscription_status"),
+            "daily_limit": limit,
+            "used_today": used,
+            "remaining_credits": max(0, limit - used),
+        })
+
+    users.sort(key=lambda u: u.get("createdAt") or "", reverse=True)
+    return {"date": date_key, "count": len(users), "users": users}
+
+
+@app.delete("/admin/users/{uid}/portfolio")
+async def delete_user_portfolio(uid: str, x_admin_secret: str = Header(None)):
+    """Wipe a user's uploaded resume so the upload flow can be tested again.
+
+    Leaves the account and their GitHub connection alone - this is the "start
+    over from the resume upload" button, not a delete.
+    """
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    cleared = []
+    for template in ("sde", "bda", "custom"):
+        ref = db.collection(template).document(uid)
+        if ref.get().exists:
+            ref.delete()
+            cleared.append(template)
+    return {"uid": uid, "cleared": cleared}
+
+
+@app.delete("/admin/users/{uid}/github")
+async def purge_user_github(uid: str, x_admin_secret: str = Header(None)):
+    """Disconnect a user's GitHub so the OAuth flow can be tested again.
+
+    Was done straight from the admin browser, which the security rules will
+    refuse twice over: the admin app never signs in, and github_access_token
+    is a backend-only field.
+    """
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    db.collection("users").document(uid).update({
+        "github_connected": False,
+        "github_access_token": firestore.DELETE_FIELD,
+        "github_username": firestore.DELETE_FIELD,
+        "github_id": firestore.DELETE_FIELD,
+    })
+    return {"uid": uid, "github_connected": False}
+
+
+@app.post("/admin/users/{uid}/reset-credits")
+async def reset_user_credits(uid: str, x_admin_secret: str = Header(None)):
+    """Give a user their full daily Suggest a Fix allowance back.
+
+    Deletes today's usage document rather than zeroing it - a missing document
+    already means "nothing used today", which is the same path a new day takes.
+    """
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    date_key = quota.today_key()
+    usage_ref = (
+        db.collection("users").document(uid).collection("usage").document(date_key)
+    )
+    existed = usage_ref.get().exists
+    if existed:
+        usage_ref.delete()
+
+    status = quota.get_status(db, uid)
+    return {"uid": uid, "date": date_key, "reset": existed, **status}
+
 
 @app.get("/admin/debug")
 async def admin_debug():
