@@ -296,6 +296,25 @@ async def reset_user_credits(uid: str, x_admin_secret: str = Header(None)):
     return {"uid": uid, "date": date_key, "reset": existed, **status}
 
 
+@app.post("/admin/rate-limit/reset")
+async def reset_rate_limit(x_admin_secret: str = Header(None)):
+    """Clear the /parse-resume rate limiter (1 request per minute per IP).
+
+    Testing the upload flow repeatedly otherwise means waiting out the minute
+    after every attempt. The limiter keeps its counters in memory in this
+    process, so this clears every key rather than one - fine for a single
+    instance, and the counters are lost on restart anyway.
+    """
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        cleared = limiter.limiter.storage.reset()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not reset limiter: {e}")
+    return {"cleared_keys": cleared, "limit": "1/minute on /parse-resume"}
+
+
 @app.get("/admin/debug")
 async def admin_debug():
     # TEMPORARY: reports whether the backend sees ADMIN_SECRET (not its value)
