@@ -7,3 +7,4 @@ slowapi
 httpx
 python-dotenv
 firebase-admin
+razorpay
