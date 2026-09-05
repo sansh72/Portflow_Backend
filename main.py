@@ -14,6 +14,9 @@ import os
 import secrets
 from firebase_config import db
 from firebase_admin import auth as admin_auth
+import errors
+import suggestions
+import payments
 
 load_dotenv()
 
@@ -46,6 +49,11 @@ app.state.limiter = limiter
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests. Try again in a minute."})
 app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+
+# Suggest a Fix / payments error codes -> JSON bodies the frontend branches on
+app.add_exception_handler(errors.AppError, errors.app_error_handler)
+app.include_router(suggestions.router)
+app.include_router(payments.router)
 
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
