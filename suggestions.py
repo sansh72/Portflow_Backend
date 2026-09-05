@@ -39,6 +39,11 @@ class ApplyRequest(BaseModel):
     tag: str = Field(..., max_length=64)
 
 
+class ReviewRequest(BaseModel):
+    document_id: str = Field(..., max_length=32)
+    collection: str = Field(..., max_length=32)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -105,7 +110,10 @@ def _claim_idempotency_key(key: str, uid: str):
             if record.get("uid") != uid:
                 return {"conflict": "forbidden"}
             if record.get("status") == IDEMPOTENCY_COMPLETED:
-                return {"existing_suggestion_id": record.get("suggestion_id")}
+                return {
+                    "existing_suggestion_id": record.get("suggestion_id")
+                    or record.get("review_id")
+                }
             return {"conflict": "in_progress"}
         transaction.set(
             ref, {"uid": uid, "status": IDEMPOTENCY_IN_PROGRESS, "created_at": _now()}
@@ -135,6 +143,26 @@ def _replay(suggestion_id: str, uid: str) -> dict:
         "analysis": data.get("analysis"),
         "suggested_tags": data.get("suggested_tags", []),
         "tag_labels": llm.TAG_LABELS,
+        "remaining_credits": status["remaining_credits"],
+        "daily_limit": status["daily_limit"],
+        "plan": status["plan"],
+    }
+
+
+def _replay_review(review_id: str, uid: str) -> dict:
+    snap = db.collection("reviews").document(review_id).get()
+    if not snap.exists:
+        raise errors.suggestion_not_found()
+    data = snap.to_dict() or {}
+    if data.get("uid") != uid:
+        raise errors.forbidden()
+    status = quota.get_status(db, uid)
+    return {
+        "review_id": review_id,
+        "collection": data.get("collection"),
+        "analysis": data.get("analysis"),
+        "items": data.get("items", []),
+        "verdict_labels": llm.VERDICT_LABELS,
         "remaining_credits": status["remaining_credits"],
         "daily_limit": status["daily_limit"],
         "plan": status["plan"],
@@ -317,3 +345,89 @@ async def apply_suggestion(
         "version": outcome["version"],
         "content": rewritten,
     }
+
+
+@router.post("/reviews")
+async def review_collection(
+    body: ReviewRequest,
+    uid: str = Depends(require_uid),
+    idempotency_key: str = Header(None, alias="Idempotency-Key"),
+):
+    """Review a whole collection and advise which entries to keep, rewrite or drop.
+
+    Advisory only: nothing is deleted or rewritten here. Acting on the advice is
+    the user's call - rewriting one entry goes through the normal per-section
+    Analyze/Apply flow, and removing one is a manual edit. Costs one credit,
+    same as an analysis.
+    """
+    if body.collection not in sections.REVIEWABLE_COLLECTIONS:
+        raise errors.AppError(
+            400, "INVALID_COLLECTION", f"'{body.collection}' cannot be reviewed."
+        )
+
+    key_ref = None
+    if idempotency_key:
+        key_ref, existing_id = _claim_idempotency_key(idempotency_key[:128], uid)
+        if existing_id:
+            return _replay_review(existing_id, uid)
+
+    try:
+        _, doc_data = _load_portfolio_doc(uid, body.document_id)
+        entries = sections.read_collection(doc_data["portfolio"], body.collection)
+        if entries is None:
+            raise errors.section_not_found(body.collection)
+        if len(entries) < sections.MIN_COLLECTION_ITEMS:
+            raise errors.AppError(
+                400,
+                "NOT_ENOUGH_ITEMS",
+                f"Add at least {sections.MIN_COLLECTION_ITEMS} entries before asking for a review.",
+            )
+
+        plan = quota.get_plan(db, uid)
+        remaining = quota.consume(db, uid, plan)
+
+        try:
+            layout = sections.COLLECTION_LAYOUT.get(body.collection, {})
+            result = llm.review_collection(
+                entries,
+                body.collection,
+                keep_target=layout.get("keep_target", 0),
+                layout=layout.get("layout", ""),
+            )
+        except errors.AppError:
+            remaining = quota.refund(db, uid, plan)
+            raise
+
+        review_id = uuid.uuid4().hex
+        db.collection("reviews").document(review_id).set({
+            "uid": uid,
+            "document_id": body.document_id,
+            "collection": body.collection,
+            "analysis": result["analysis"],
+            "items": result["items"],
+            "created_at": _now(),
+        })
+
+        if key_ref:
+            key_ref.set(
+                {"review_id": review_id, "status": IDEMPOTENCY_COMPLETED}, merge=True
+            )
+
+        status = quota.get_status(db, uid)
+        return {
+            "review_id": review_id,
+            "collection": body.collection,
+            "analysis": result["analysis"],
+            "items": result["items"],
+            "verdict_labels": llm.VERDICT_LABELS,
+            "remaining_credits": remaining,
+            "daily_limit": status["daily_limit"],
+            "plan": status["plan"],
+        }
+    except Exception:
+        if key_ref:
+            try:
+                key_ref.delete()
+            except Exception:
+                logger.warning("Could not release idempotency key %s", idempotency_key)
+        raise
